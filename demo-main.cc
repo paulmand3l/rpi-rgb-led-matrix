@@ -12,7 +12,9 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
+
 #include <algorithm>
 
 using std::min;
@@ -69,9 +71,7 @@ private:
 // Simple generator that pulses through RGB and White.
 class ColorPulseGenerator : public ThreadedCanvasManipulator {
 public:
-  ColorPulseGenerator(RGBMatrix *m) : ThreadedCanvasManipulator(m), matrix_(m) {
-    off_screen_canvas_ = m->CreateFrameCanvas();
-  }
+  ColorPulseGenerator(Canvas *m) : ThreadedCanvasManipulator(m) {}
   void Run() {
     uint32_t continuum = 0;
     while (running()) {
@@ -92,46 +92,9 @@ public:
         g = 255 - c;
         b = c;
       }
-      off_screen_canvas_->Fill(r, g, b);
-      off_screen_canvas_ = matrix_->SwapOnVSync(off_screen_canvas_);
+      canvas()->Fill(r, g, b);
     }
   }
-  
-private:
-  RGBMatrix *const matrix_;
-  FrameCanvas *off_screen_canvas_;
-};
-
-// Simple generator that pulses through brightness on red, green, blue and white 
-class BrightnessPulseGenerator : public ThreadedCanvasManipulator {
-public:
-  BrightnessPulseGenerator(RGBMatrix *m) : ThreadedCanvasManipulator(m), matrix_(m) {}
-  void Run() {
-    const uint8_t max_brightness = matrix_->brightness();
-    const uint8_t c = 255;
-    uint8_t count = 0;
-
-    while (running()) {
-      if (matrix_->brightness() < 1) {
-        matrix_->SetBrightness(max_brightness);
-        count++;
-      } else {
-        matrix_->SetBrightness(matrix_->brightness() - 1);
-      }
-
-      switch (count % 4) {
-        case 0: matrix_->Fill(c, 0, 0); break;
-        case 1: matrix_->Fill(0, c, 0); break;
-        case 2: matrix_->Fill(0, 0, c); break;
-        case 3: matrix_->Fill(c, c, c); break;
-      }
-
-      usleep(20 * 1000);
-    }
-  }
-
-private:
-  RGBMatrix *const matrix_;
 };
 
 class SimpleSquare : public ThreadedCanvasManipulator {
@@ -249,12 +212,10 @@ class ImageScroller : public ThreadedCanvasManipulator {
 public:
   // Scroll image with "scroll_jumps" pixels every "scroll_ms" milliseconds.
   // If "scroll_ms" is negative, don't do any scrolling.
-  ImageScroller(RGBMatrix *m, int scroll_jumps, int scroll_ms = 30)
+  ImageScroller(Canvas *m, int scroll_jumps, int scroll_ms = 30)
     : ThreadedCanvasManipulator(m), scroll_jumps_(scroll_jumps),
       scroll_ms_(scroll_ms),
-      horizontal_position_(0),
-      matrix_(m) {
-      offscreen_ = matrix_->CreateFrameCanvas();
+      horizontal_position_(0) {
   }
 
   virtual ~ImageScroller() {
@@ -268,11 +229,6 @@ public:
   // life-update the content.
   bool LoadPPM(const char *filename) {
     FILE *f = fopen(filename, "r");
-    // check if file exists
-    if (f == NULL && access(filename, F_OK) == -1) {
-      fprintf(stderr, "File \"%s\" doesn't exist\n", filename);
-      return false;
-    }
     if (f == NULL) return false;
     char header_buf[256];
     const char *line = ReadLine(f, header_buf, sizeof(header_buf));
@@ -328,10 +284,9 @@ public:
         for (int y = 0; y < screen_height; ++y) {
           const Pixel &p = current_image_.getPixel(
                      (horizontal_position_ + x) % current_image_.width, y);
-          offscreen_->SetPixel(x, y, p.red, p.green, p.blue);
+          canvas()->SetPixel(x, y, p.red, p.green, p.blue);
         }
       }
-      offscreen_ = matrix_->SwapOnVSync(offscreen_);
       horizontal_position_ += scroll_jumps_;
       if (horizontal_position_ < 0) horizontal_position_ = current_image_.width;
       if (scroll_ms_ <= 0) {
@@ -388,9 +343,6 @@ private:
   Image new_image_;
 
   int32_t horizontal_position_;
-
-  RGBMatrix* matrix_;
-  FrameCanvas* offscreen_;
 };
 
 
@@ -402,7 +354,7 @@ public:
     : ThreadedCanvasManipulator(m), delay_ms_(delay_ms) {
     width_ = canvas()->width() - 1; // We need an odd width
     height_ = canvas()->height() - 1; // We need an odd height
-
+    
     // Allocate memory
     values_ = new int*[width_];
     for (int x=0; x<width_; ++x) {
@@ -412,7 +364,7 @@ public:
     for (int x=0; x<width_; ++x) {
       newValues_[x] = new int[height_];
     }
-
+    
     // Init values
     srand(time(NULL));
     for (int x=0; x<width_; ++x) {
@@ -438,7 +390,7 @@ public:
       // Drop a sand grain in the centre
       values_[width_/2][height_/2]++;
       updateValues();
-
+      
       for (int x=0; x<width_; ++x) {
         for (int y=0; y<height_; ++y) {
           switch (values_[x][y]) {
@@ -513,7 +465,7 @@ public:
     : ThreadedCanvasManipulator(m), delay_ms_(delay_ms), torus_(torus) {
     width_ = canvas()->width();
     height_ = canvas()->height();
-
+    
     // Allocate memory
     values_ = new int*[width_];
     for (int x=0; x<width_; ++x) {
@@ -523,7 +475,7 @@ public:
     for (int x=0; x<width_; ++x) {
       newValues_[x] = new int[height_];
     }
-
+    
     // Init values randomly
     srand(time(NULL));
     for (int x=0; x<width_; ++x) {
@@ -534,7 +486,7 @@ public:
     r_ = rand()%255;
     g_ = rand()%255;
     b_ = rand()%255;
-
+    
     if (r_<150 && g_<150 && b_<150) {
       int c = rand()%3;
       switch (c) {
@@ -564,9 +516,9 @@ public:
 
   void Run() {
     while (running()) {
-
+      
       updateValues();
-
+      
       for (int x=0; x<width_; ++x) {
         for (int y=0; y<height_; ++y) {
           if (values_[x][y])
@@ -616,7 +568,7 @@ private:
     }
     return num;
   }
-
+  
   void updateValues() {
     // Copy values to newValues
     for (int x=0; x<width_; ++x) {
@@ -691,8 +643,8 @@ public:
         updatePixel(x, y);
       }
     }
-
-    while (running()) {
+    
+    while (running()) {      
       // LLRR
       switch (values_[antX_][antY_]) {
         case 0:
@@ -704,7 +656,7 @@ public:
           antDir_ = (antDir_-1+4) % 4;
           break;
       }
-
+      
       values_[antX_][antY_] = (values_[antX_][antY_] + 1) % numColors_;
       int oldX = antX_;
       int oldY = antY_;
@@ -789,7 +741,7 @@ public:
     heightYellow_ = height_*8/12;
     heightOrange_ = height_*10/12;
     heightRed_    = height_*12/12;
-
+    
     // Array of possible bar means
     int numMeans = 10;
     int means[10] = {1,2,3,4,5,6,7,8,16,32};
@@ -802,7 +754,7 @@ public:
       barMeans_[i] = rand()%numMeans;
       barFreqs_[i] = 1<<(rand()%3);
     }
-
+    
     // Start the loop
     while (running()) {
       if (t_ % 8 == 0) {
@@ -815,7 +767,7 @@ public:
             barMeans_[i] = 0;
         }
       }
-
+      
       // Update bar heights
       t_++;
       for (int i=0; i<numBars_; ++i) {
@@ -824,7 +776,7 @@ public:
         if (barHeights_[i] < height_/8)
           barHeights_[i] = rand() % (height_/8) + 1;
       }
-
+      
       for (int i=0; i<numBars_; ++i) {
         int y;
         for (y=0; y<barHeights_[i]; ++y) {
@@ -871,201 +823,22 @@ private:
   int t_;
 };
 
-/// Genetic Colors
-/// A genetic algorithm to evolve colors
-/// by bbhsu2 + anonymous
-class GeneticColors : public ThreadedCanvasManipulator {
-public:
-  GeneticColors(Canvas *m, int delay_ms = 200)
-    : ThreadedCanvasManipulator(m), delay_ms_(delay_ms) {
-    width_ = canvas()->width();
-    height_ = canvas()->height();
-    popSize_ = width_ * height_;
-
-    // Allocate memory
-    children_ = new citizen[popSize_];
-    parents_ = new citizen[popSize_];
-    srand(time(NULL));
-  }
-
-  ~GeneticColors() {
-    delete [] children_;
-    delete [] parents_;
-  }
-
-  static int rnd (int i) { return rand() % i; }
-
-  void Run() {
-    // Set a random target_
-    target_ = rand() & 0xFFFFFF;
-
-    // Create the first generation of random children_
-    for (int i = 0; i < popSize_; ++i) {
-      children_[i].dna = rand() & 0xFFFFFF;
-    }
-
-    while(running()) {
-      swap();
-      sort();
-      mate();
-      std::random_shuffle (children_, children_ + popSize_, rnd);
-
-      // Draw citizens to canvas
-      for(int i=0; i < popSize_; i++) {
-        int c = children_[i].dna;
-        int x = i % width_;
-        int y = (int)(i / width_);
-        canvas()->SetPixel(x, y, R(c), G(c), B(c));
-      }
-
-      // When we reach the 85% fitness threshold...
-      if(is85PercentFit()) {
-        // ...set a new random target_
-        target_ = rand() & 0xFFFFFF;
-
-        // Randomly mutate everyone for sake of new colors
-        for (int i = 0; i < popSize_; ++i) {
-          mutate(children_[i]);
-        }
-      }
-      usleep(delay_ms_ * 1000);
-    }
-  }
-
-private:
-  /// citizen will hold dna information, a 24-bit color value.
-  struct citizen {
-    citizen() { }
-
-    citizen(int chrom)
-      : dna(chrom) {
-    }
-
-    int dna;
-  };
-
-  /// for sorting by fitness
-  class comparer {
-  public:
-    comparer(int t)
-      : target_(t) { }
-
-    inline bool operator() (const citizen& c1, const citizen& c2) {
-      return (calcFitness(c1.dna, target_) < calcFitness(c2.dna, target_));
-    }
-
-  private:
-    const int target_;
-  };
-
-  static int R(const int cit) { return at(cit, 16); }
-  static int G(const int cit) { return at(cit, 8); }
-  static int B(const int cit) { return at(cit, 0); }
-  static int at(const int v, const  int offset) { return (v >> offset) & 0xFF; }
-
-  /// fitness here is how "similar" the color is to the target
-  static int calcFitness(const int value, const int target) {
-    // Count the number of differing bits
-    int diffBits = 0;
-    for (unsigned int diff = value ^ target; diff; diff &= diff - 1) {
-      ++diffBits;
-    }
-    return diffBits;
-  }
-
-  /// sort by fitness so the most fit citizens are at the top of parents_
-  /// this is to establish an elite population of greatest fitness
-  /// the most fit members and some others are allowed to reproduce
-  /// to the next generation
-  void sort() {
-    std::sort(parents_, parents_ + popSize_, comparer(target_));
-  }
-
-  /// let the elites continue to the next generation children
-  /// randomly select 2 parents of (near)elite fitness and determine
-  /// how they will mate. after mating, randomly mutate citizens
-  void mate() {
-    // Adjust these for fun and profit
-    const float eliteRate = 0.30f;
-    const float mutationRate = 0.20f;
-
-    const int numElite = popSize_ * eliteRate;
-    for (int i = 0; i < numElite; ++i) {
-      children_[i] = parents_[i];
-    }
-
-    for (int i = numElite; i < popSize_; ++i) {
-      //select the parents randomly
-      const float sexuallyActive = 1.0 - eliteRate;
-      const int p1 = rand() % (int)(popSize_ * sexuallyActive);
-      const int p2 = rand() % (int)(popSize_ * sexuallyActive);
-      const int matingMask = (~0) << (rand() % bitsPerPixel);
-
-      // Make a baby
-      int baby = (parents_[p1].dna & matingMask)
-        | (parents_[p2].dna & ~matingMask);
-      children_[i].dna = baby;
-
-      // Mutate randomly based on mutation rate
-      if ((rand() / (float)RAND_MAX) < mutationRate) {
-        mutate(children_[i]);
-      }
-    }
-  }
-
-  /// parents make children,
-  /// children become parents,
-  /// and they make children...
-  void swap() {
-    citizen* temp = parents_;
-    parents_ = children_;
-    children_ = temp;
-  }
-
-  void mutate(citizen& c) {
-    // Flip a random bit
-    c.dna ^= 1 << (rand() % bitsPerPixel);
-  }
-
-  /// can adjust this threshold to make transition to new target seamless
-  bool is85PercentFit() {
-    int numFit = 0;
-    for (int i = 0; i < popSize_; ++i) {
-        if (calcFitness(children_[i].dna, target_) < 1) {
-            ++numFit;
-        }
-    }
-    return ((numFit / (float)popSize_) > 0.85f);
-  }
-
-  static const int bitsPerPixel = 24;
-  int popSize_;
-  int width_, height_;
-  int delay_ms_;
-  int target_;
-  citizen* children_;
-  citizen* parents_;
-};
-
 static int usage(const char *progname) {
   fprintf(stderr, "usage: %s <options> -D <demo-nr> [optional parameter]\n",
           progname);
   fprintf(stderr, "Options:\n"
           "\t-r <rows>     : Display rows. 16 for 16x32, 32 for 32x32. "
           "Default: 32\n"
-          "\t-P <parallel> : For Plus-models or RPi2: parallel chains. 1..3. "
-          "Default: 1\n"
-          "\t-c <chained>     : Daisy-chained boards. Default: 1.\n"
-          "\t-L               : 'Large' display, composed out of 4 times 32x32\n"
-          "\t-p <pwm-bits>    : Bits used for PWM. Something between 1..11\n"
-          "\t-l               : Don't do luminance correction (CIE1931)\n"
-          "\t-D <demo-nr>     : Always needs to be set\n"
-          "\t-d               : run as daemon. Use this when starting in\n"
-          "\t                   /etc/init.d, but also when running without\n"
-          "\t                   terminal (e.g. cron).\n"
-          "\t-t <seconds>     : Run for these number of seconds, then exit.\n"
-          "\t                   (if neither -d nor -t are supplied, waits for <RETURN>)\n"
-          "\t-b <brightness>  : Sets brightness percent. Default: 100.\n");
+          "\t-c <chained>  : Daisy-chained boards. Default: 1.\n"
+          "\t-L            : 'Large' display, composed out of 4 times 32x32\n"
+          "\t-p <pwm-bits> : Bits used for PWM. Something between 1..11\n"
+          "\t-l            : Don't do luminance correction (CIE1931)\n"
+          "\t-D <demo-nr>  : Always needs to be set\n"
+          "\t-d            : run as daemon. Use this when starting in\n"
+          "\t                /etc/init.d, but also when running without\n"
+          "\t                terminal (e.g. cron).\n"
+          "\t-t <seconds>  : Run for these number of seconds, then exit.\n"
+          "\t       (if neither -d nor -t are supplied, waits for <RETURN>)\n");
   fprintf(stderr, "Demos, choosen with -D\n");
   fprintf(stderr, "\t0  - some rotating square\n"
           "\t1  - forward scrolling an image (-m <scroll-ms>)\n"
@@ -1076,9 +849,7 @@ static int usage(const char *progname) {
           "\t6  - Abelian sandpile model (-m <time-step-ms>)\n"
           "\t7  - Conway's game of life (-m <time-step-ms>)\n"
           "\t8  - Langton's ant (-m <time-step-ms>)\n"
-          "\t9  - Volume bars (-m <time-step-ms>)\n"
-          "\t10 - Evolution of color (-m <time-step-ms>)\n"
-          "\t11 - Brightness pulse generator\n");
+          "\t9  - Volume bars (-m <time-step-ms>)\n");
   fprintf(stderr, "Example:\n\t%s -t 10 -D 1 runtext.ppm\n"
           "Scrolls the runtext for 10 seconds\n", progname);
   return 1;
@@ -1090,17 +861,15 @@ int main(int argc, char *argv[]) {
   int demo = -1;
   int rows = 32;
   int chain = 1;
-  int parallel = 1;
   int scroll_ms = 30;
   int pwm_bits = -1;
-  int brightness = 100;
   bool large_display = false;
   bool do_luminance_correct = true;
 
   const char *demo_parameter = NULL;
 
   int opt;
-  while ((opt = getopt(argc, argv, "dlD:t:r:P:c:p:b:m:L")) != -1) {
+  while ((opt = getopt(argc, argv, "dlD:t:r:p:c:m:L")) != -1) {
     switch (opt) {
     case 'D':
       demo = atoi(optarg);
@@ -1118,10 +887,6 @@ int main(int argc, char *argv[]) {
       rows = atoi(optarg);
       break;
 
-    case 'P':
-      parallel = atoi(optarg);
-      break;
-
     case 'c':
       chain = atoi(optarg);
       break;
@@ -1132,10 +897,6 @@ int main(int argc, char *argv[]) {
 
     case 'p':
       pwm_bits = atoi(optarg);
-      break;
-
-    case 'b':
-      brightness = atoi(optarg);
       break;
 
     case 'l':
@@ -1181,15 +942,6 @@ int main(int argc, char *argv[]) {
   if (chain > 8) {
     fprintf(stderr, "That is a long chain. Expect some flicker.\n");
   }
-  if (parallel < 1 || parallel > 3) {
-    fprintf(stderr, "Parallel outside usable range.\n");
-    return 1;
-  }
-
-  if (brightness < 1 || brightness > 100) {
-    fprintf(stderr, "Brightness is outside usable range.\n");
-    return 1;
-  }
 
   // Initialize GPIO pins. This might fail when we don't have permissions.
   GPIO io;
@@ -1206,9 +958,8 @@ int main(int argc, char *argv[]) {
   }
 
   // The matrix, our 'frame buffer' and display updater.
-  RGBMatrix *matrix = new RGBMatrix(&io, rows, chain, parallel);
+  RGBMatrix *matrix = new RGBMatrix(&io, rows, chain);
   matrix->set_luminance_correct(do_luminance_correct);
-  matrix->SetBrightness(brightness);
   if (pwm_bits >= 0 && !matrix->SetPWMBits(pwm_bits)) {
     fprintf(stderr, "Invalid range of pwm-bits\n");
     return 1;
@@ -1232,7 +983,7 @@ int main(int argc, char *argv[]) {
   case 1:
   case 2:
     if (demo_parameter) {
-      ImageScroller *scroller = new ImageScroller(matrix,
+      ImageScroller *scroller = new ImageScroller(canvas,
                                                   demo == 1 ? 1 : -1,
                                                   scroll_ms);
       if (!scroller->LoadPPM(demo_parameter))
@@ -1249,7 +1000,7 @@ int main(int argc, char *argv[]) {
     break;
 
   case 4:
-    image_gen = new ColorPulseGenerator(matrix);
+    image_gen = new ColorPulseGenerator(canvas);
     break;
 
   case 5:
@@ -1270,14 +1021,6 @@ int main(int argc, char *argv[]) {
 
   case 9:
     image_gen = new VolumeBars(canvas, scroll_ms, canvas->width()/2);
-    break;
-
-  case 10:
-    image_gen = new GeneticColors(canvas, scroll_ms);
-    break;
-
-  case 11:
-    image_gen = new BrightnessPulseGenerator(matrix);
     break;
   }
 

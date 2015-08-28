@@ -1,7 +1,5 @@
-CXXFLAGS=-Wall -O3 -g
-OBJECTS=demo-main.o minimal-example.o text-example.o led-image-viewer.o
-BINARIES=led-matrix minimal-example text-example
-ALL_BINARIES=$(BINARIES) led-image-viewer
+CXXFLAGS=-Wall -O3 -g -fno-strict-aliasing
+BINARIES=led-matrix minimal-example text-example rgbmatrix.so
 
 # Where our library resides. It is split between includes and the binary
 # library in lib
@@ -10,12 +8,6 @@ RGB_LIBDIR=lib
 RGB_LIBRARY_NAME=rgbmatrix
 RGB_LIBRARY=$(RGB_LIBDIR)/lib$(RGB_LIBRARY_NAME).a
 LDFLAGS+=-L$(RGB_LIBDIR) -l$(RGB_LIBRARY_NAME) -lrt -lm -lpthread
-
-PYTHON_LIB_DIR=python
-
-# Imagemagic flags, only needed if actually compiled.
-MAGICK_CXXFLAGS=`GraphicsMagick++-config --cppflags --cxxflags`
-MAGICK_LDFLAGS=`GraphicsMagick++-config --ldflags --libs`
 
 all : $(BINARIES)
 
@@ -31,22 +23,13 @@ minimal-example : minimal-example.o $(RGB_LIBRARY)
 text-example : text-example.o $(RGB_LIBRARY)
 	$(CXX) $(CXXFLAGS) text-example.o -o $@ $(LDFLAGS)
 
-led-image-viewer: led-image-viewer.o $(RGB_LIBRARY)
-	$(CXX) $(CXXFLAGS) led-image-viewer.o -o $@ $(LDFLAGS) $(MAGICK_LDFLAGS)
+# Python module
+rgbmatrix.so: rgbmatrix.o $(RGB_LIBRARY)
+	$(CXX) -s -shared -lstdc++ -Wl,-soname,librgbmatrix.so -o $@ $< $(LDFLAGS)
 
 %.o : %.cc
-	$(CXX) -I$(RGB_INCDIR) $(CXXFLAGS) -c -o $@ $<
-
-led-image-viewer.o : led-image-viewer.cc
-	$(CXX) -I$(RGB_INCDIR) $(CXXFLAGS) $(MAGICK_CXXFLAGS) -c -o $@ $<
+	$(CXX) -I$(RGB_INCDIR) $(CXXFLAGS) -DADAFRUIT_RGBMATRIX_HAT -c -o $@ $<
 
 clean:
-	rm -f $(OBJECTS) $(ALL_BINARIES)
+	rm -f *.o $(OBJECTS) $(BINARIES)
 	$(MAKE) -C lib clean
-	$(MAKE) -C $(PYTHON_LIB_DIR) clean
-
-build-python: $(RGB_LIBRARY)
-	$(MAKE) -C $(PYTHON_LIB_DIR) build
-
-install-python: build-python
-	$(MAKE) -C $(PYTHON_LIB_DIR) install

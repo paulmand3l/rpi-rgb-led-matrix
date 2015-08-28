@@ -18,8 +18,6 @@
 
 #include <stdint.h>
 
-#include <vector>
-
 // Putting this in our namespace to not collide with other things called like
 // this.
 namespace rgb_matrix {
@@ -40,10 +38,20 @@ class GPIO {
   uint32_t InitOutputs(uint32_t outputs);
 
   // Set the bits that are '1' in the output. Leave the rest untouched.
-  void SetBits(uint32_t value);
+  inline void SetBits(uint32_t value) {
+    gpio_port_[0x1C / sizeof(uint32_t)] = value;
+#if RGB_SLOWDOWN_GPIO
+    gpio_port_[0x1C / sizeof(uint32_t)] = value;
+#endif
+  }
 
   // Clear the bits that are '1' in the output. Leave the rest untouched.
-  void ClearBits(uint32_t value);
+  inline void ClearBits(uint32_t value) {
+    gpio_port_[0x28 / sizeof(uint32_t)] = value;
+#if RGB_SLOWDOWN_GPIO
+    gpio_port_[0x28 / sizeof(uint32_t)] = value;
+#endif
+  }
 
   // Write all the bits of "value" mentioned in "mask". Leave the rest untouched.
   inline void WriteMaskedBits(uint32_t value, uint32_t mask) {
@@ -59,25 +67,5 @@ class GPIO {
   uint32_t output_bits_;
   volatile uint32_t *gpio_port_;
 };
-
-// A PinPulser is a utility class that pulses a GPIO pin. There can be various
-// implementations.
-class PinPulser {
-public:
-  // Factory for a PinPulser. Chooses the right implementation depending
-  // on the context (CPU and which pins are affected).
-  // "gpio_mask" is the mask that should be output (since we only
-  //   need negative pulses, this is what it does)
-  // "nano_wait_spec" contains a list of time periods we'd like
-  //   invoke later. This can be used to pre-process timings if needed.
-  static PinPulser *Create(GPIO *io, uint32_t gpio_mask,
-                           const std::vector<int> &nano_wait_spec);
-
-  virtual ~PinPulser() {}
-
-  // Send a pulse with a given length (index into nano_wait_spec array).
-  virtual void SendPulse(int time_spec_number) = 0;
-};
-
 }  // end namespace rgb_matrix
 #endif  // RPI_GPIO_H

@@ -15,22 +15,15 @@
 
 #include "gpio.h"
 
-// Raspberry 1 and 2 have different base addresses for the periphery
-#define BCM2708_PERI_BASE        0x20000000
-#define BCM2709_PERI_BASE        0x3F000000
-
-#define GPIO_REGISTER_OFFSET         0x200000
-#define COUNTER_1Mhz_REGISTER_OFFSET   0x3000
-
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
 
-#define REGISTER_BLOCK_SIZE (4*1024)
+#define PAGE_SIZE (4*1024)
+#define BLOCK_SIZE (4*1024)
 
 // GPIO setup macros. Always use INP_GPIO(x) before using OUT_GPIO(x) or SET_GPIO_ALT(x,y)
 #define INP_GPIO(g) *(gpio_port_+((g)/10)) &= ~(7<<(((g)%10)*3))
@@ -40,24 +33,25 @@
 #define GPIO_SET *(gpio+7)  // sets   bits which are 1 ignores bits which are 0
 #define GPIO_CLR *(gpio+10) // clears bits which are 1 ignores bits which are 0
 
-namespace rgb_matrix {
-/*static*/ const uint32_t GPIO::kValidBits
-= ((1 <<  0) | (1 <<  1) | // RPi 1 - Revision 1 accessible
-   (1 <<  2) | (1 <<  3) | // RPi 1 - Revision 2 accessible
+/*static*/ const uint32_t ::rgb_matrix::GPIO::kValidBits 
+= ((1 <<  0) | (1 <<  1) | // Revision 1 accessible
+   (1 <<  2) | (1 <<  3) | // Revision 2 accessible
    (1 <<  4) | (1 <<  7) | (1 << 8) | (1 <<  9) |
-   (1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)| (1 <<17) | (1 << 18) |
-   (1 << 22) | (1 << 23) | (1 << 24) | (1 << 25)| (1 << 27) |
-   // support for A+/B+ and RPi2 with additional GPIO pins.
-   (1 <<  5) | (1 <<  6) | (1 << 12) | (1 << 13) | (1 << 16) |
-   (1 << 19) | (1 << 20) | (1 << 21) | (1 << 26)
+   (1 << 10) | (1 << 11) | (1 << 14) | (1 << 15)| (1 <<17) | (1 << 18)|
+   (1 << 22) | (1 << 23) | (1 << 24) | (1 << 25)| (1 << 27)
+// Add support for A+/B+!
+ | (1 <<  5) | (1 <<  6) | (1 << 12) | (1 << 13) | (1 << 16) |
+   (1 << 19) | (1 << 20) | (1 << 21) | (1 << 26)  
 );
+   
 
+namespace rgb_matrix {
 GPIO::GPIO() : output_bits_(0), gpio_port_(NULL) {
 }
-
+   
 uint32_t GPIO::InitOutputs(uint32_t outputs) {
   if (gpio_port_ == NULL) {
-    fprintf(stderr, "Attempt to init outputs but not yet Init()-ialized.\n");
+    fprintf(stderr, "Attempt to init outputs but initialized.\n");
     return 0;
   }
   outputs &= kValidBits;   // Sanitize input.
@@ -71,177 +65,119 @@ uint32_t GPIO::InitOutputs(uint32_t outputs) {
   return output_bits_;
 }
 
-static bool IsRaspberryPi2() {
-  // TODO: there must be a better, more robust way. Can we ask the processor ?
-  char buffer[2048];
-  const int fd = open("/proc/cmdline", O_RDONLY);
-  ssize_t r = read(fd, buffer, sizeof(buffer) - 1); // returns all in one read.
-  buffer[r >= 0 ? r : 0] = '\0';
-  close(fd);
-  const char *mem_size_key;
-  off_t mem_size;
-  if ((mem_size_key = strstr(buffer, "mem_size=")) != NULL
-      && (sscanf(mem_size_key + strlen("mem_size="), "%lx", &mem_size) == 1)
-      && (mem_size == 0x3F000000)) {
-    return true;
-  }
-  return false;
-}
+// Detect Pi board type.  Doesn't return super-granular details,
+// just the most basic distinction needed for GPIO compatibility:
+// 0: Pi 1 Model B revision 1
+// 1: Pi 1 Model B revision 2, Model A, Model B+, Model A+
+// 2: Pi 2 Model B
 
-static uint32_t *mmap_bcm_register(bool isRPi2, off_t register_offset) {
-  const off_t base = (isRPi2 ? BCM2709_PERI_BASE : BCM2708_PERI_BASE);
+int boardType(void) {
+	FILE *fp;
+	char  buf[1024], *ptr;
+	int   n, board = 1; // Assume Pi1 Rev2 by default
 
-  int mem_fd;
-  if ((mem_fd = open("/dev/mem", O_RDWR|O_SYNC) ) < 0) {
-    perror("can't open /dev/mem: ");
-    return NULL;
-  }
+	// Relies on info in /proc/cmdline.  If this becomes unreliable
+	// in the future, alt code below uses /proc/cpuinfo if any better.
+#if 1
+	if((fp = fopen("/proc/cmdline", "r"))) {
+		while(fgets(buf, sizeof(buf), fp)) {
+			if((ptr = strstr(buf, "mem_size=")) &&
+			   (sscanf(&ptr[9], "%x", &n) == 1) &&
+			   (n == 0x3F000000)) {
+				board = 2; // Appears to be a Pi 2
+				break;
+			} else if((ptr = strstr(buf, "boardrev=")) &&
+			          (sscanf(&ptr[9], "%x", &n) == 1) &&
+			          ((n == 0x02) || (n == 0x03))) {
+				board = 0; // Appears to be an early Pi
+				break;
+			}
+		}
+		fclose(fp);
+	}
+#else
+	char s[8];
+	if((fp = fopen("/proc/cpuinfo", "r"))) {
+		while(fgets(buf, sizeof(buf), fp)) {
+			if((ptr = strstr(buf, "Hardware")) &&
+			   (sscanf(&ptr[8], " : %7s", s) == 1) &&
+			   (!strcmp(s, "BCM2709"))) {
+				board = 2; // Appears to be a Pi 2
+				break;
+			} else if((ptr = strstr(buf, "Revision")) &&
+			          (sscanf(&ptr[8], " : %x", &n) == 1) &&
+			          ((n == 0x02) || (n == 0x03))) {
+				board = 0; // Appears to be an early Pi
+				break;
+			}
+		}
+		fclose(fp);
+	}
+#endif
 
-  uint32_t *result =
-    (uint32_t*) mmap(NULL,                  // Any adddress in our space will do
-                     REGISTER_BLOCK_SIZE,   // Map length
-                     PROT_READ|PROT_WRITE,  // Enable r/w on GPIO registers.
-                     MAP_SHARED,
-                     mem_fd,                // File to map
-                     base + register_offset // Offset to bcm register
-                     );
-  close(mem_fd);
-
-  if (result == MAP_FAILED) {
-    fprintf(stderr, "mmap error %p\n", result);
-    return NULL;
-  }
-  return result;
+	return board;
 }
 
 // Based on code example found in http://elinux.org/RPi_Low-level_peripherals
 bool GPIO::Init() {
-  gpio_port_ = mmap_bcm_register(IsRaspberryPi2(), GPIO_REGISTER_OFFSET);
-  if (gpio_port_ == NULL) {
-    return false;
-  }
-  return true;
-}
+  int mem_fd, gpio_base;
 
-void GPIO::SetBits(uint32_t value) {
-  gpio_port_[0x1C / sizeof(uint32_t)] = value;
-#ifdef RGB_SLOWDOWN_GPIO
-  gpio_port_[0x1C / sizeof(uint32_t)] = value;
-#endif
-}
+  if(boardType() == 2) { // Raspberry Pi 2?
 
-void GPIO::ClearBits(uint32_t value) {
-  gpio_port_[0x28 / sizeof(uint32_t)] = value;
-#ifdef RGB_SLOWDOWN_GPIO
-  gpio_port_[0x28 / sizeof(uint32_t)] = value;
-#endif
-}
+    // Nasty kludge for timing on Pi 2, see notes in framebuffer.cc
+    extern volatile uint32_t *freeRunTimer;
 
-// --- PinPulser. Private implementation parts.
-namespace {
-// Manual timers.
-class Timers {
-public:
-  static bool Init();
-  static void sleep_nanos(long t);
-};
-
-// Simplest of PinPulsers. Uses somewhat jittery and manual timers
-// to get the timing, but not optimal.
-class TimerBasedPinPulser : public PinPulser {
-public:
-  TimerBasedPinPulser(GPIO *io, uint32_t bits,
-                      const std::vector<int> &nano_specs)
-    : io_(io), bits_(bits), nano_specs_(nano_specs) {}
-
-  virtual void SendPulse(int time_spec_number) {
-    io_->ClearBits(bits_);
-    Timers::sleep_nanos(nano_specs_[time_spec_number]);
-    io_->SetBits(bits_);
-  }
-
-private:
-  GPIO *const io_;
-  const uint32_t bits_;
-  const std::vector<int> nano_specs_;
-};
-
-// ----------
-// TODO: timing needs to be improved. It is jittery due to the nature of running
-// in a non-realtime operating system, and apparently the nanosleep() does not
-// make any effort to even be close to accurate.
-// ----------
-
-static volatile uint32_t *timer1Mhz = NULL;
-
-static void sleep_nanos_rpi_1(long nanos);
-static void sleep_nanos_rpi_2(long nanos);
-static void (*busy_sleep_impl)(long) = sleep_nanos_rpi_1;
-
-bool Timers::Init() {
-  const bool isRPi2 = IsRaspberryPi2();
-  uint32_t *timereg = mmap_bcm_register(isRPi2, COUNTER_1Mhz_REGISTER_OFFSET);
-  if (timereg == NULL) {
-    return false;
-  }
-  timer1Mhz = &timereg[1];
-
-  busy_sleep_impl = isRPi2 ? sleep_nanos_rpi_2 : sleep_nanos_rpi_1;
-  return true;
-}
-
-void Timers::sleep_nanos(long nanos) {
-  // For smaller durations, we go straight to busy wait.
-
-  // For larger duration, we use nanosleep() to give the operating system
-  // a chance to do something else.
-  // However, these timings have a lot of jitter, so we do a two way
-  // approach: we use nanosleep(), but for some shorter time period so
-  // that we can tolerate some jitter (also, we need at least an offset of
-  // 20usec as the nanosleep implementations on RPi actually have such offset).
-  //
-  // We use the global 1Mhz hardware timer to measure the actual time period
-  // that has passed, and then inch forward for the remaining time with
-  // busy wait.
-  if (nanos > 30000) {
-    const uint32_t before = *timer1Mhz;
-    struct timespec sleep_time = { 0, nanos - 25000 };
-    nanosleep(&sleep_time, NULL);
-    const uint32_t after = *timer1Mhz;
-    const long nanoseconds_passed = 1000 * (uint32_t)(after - before);
-    if (nanoseconds_passed > nanos) {
-      return;  // darn, missed it.
-    } else {
-      nanos -= nanoseconds_passed; // remaining time with busy-loop
+    // On Pi2, before we mmap GPIO, let's get the timer peripheral...
+    if((mem_fd = open("/dev/mem", O_RDWR|O_SYNC) ) < 0) {
+      perror("can't open /dev/mem: ");
+      return 1;
     }
+
+    char *timer_map =
+      (char*)mmap(NULL,
+      BLOCK_SIZE,
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED,
+      mem_fd,
+      0x3F003000); // Offset to free-running 1 MHz timer
+
+    close(mem_fd); // No need to keep mem_fd open after mmap
+
+    if(timer_map == MAP_FAILED) {
+      fprintf(stderr, "mmap error %ld\n", (long)timer_map);
+      return 1;
+    }
+
+    freeRunTimer = &((volatile uint32_t *)timer_map)[1];
+    // Okay then, getting back to GPIO...
+
+    gpio_base = 0x3F000000 + 0x200000; // GPIO base addr for Pi 2
+  } else {
+    gpio_base = 0x20000000 + 0x200000; // " for Pi 1
   }
 
-  busy_sleep_impl(nanos);
-}
-
-static void sleep_nanos_rpi_1(long nanos) {
-  if (nanos < 70) return;
-  // The following loop is determined empirically on a 700Mhz RPi
-  for (uint32_t i = (nanos - 70) >> 2; i != 0; --i) {
-    asm("nop");
+  if ((mem_fd = open("/dev/mem", O_RDWR|O_SYNC) ) < 0) {
+    perror("can't open /dev/mem: ");
+    return false;
   }
-}
 
-static void sleep_nanos_rpi_2(long nanos) {
-  if (nanos < 20) return;
-  // The following loop is determined empirically on a 900Mhz RPi 2
-  for (uint32_t i = (nanos - 20) * 100 / 110; i != 0; --i) {
-    asm("");
+  char *gpio_map =
+    (char*) mmap(NULL,             //Any adddress in our space will do
+         BLOCK_SIZE,       //Map length
+         PROT_READ|PROT_WRITE,// Enable reading & writting to mapped memory
+         MAP_SHARED,       //Shared with other processes
+         mem_fd,           //File to map
+         gpio_base);       //Offset to GPIO peripheral
+
+  close(mem_fd); //No need to keep mem_fd open after mmap
+
+  if (gpio_map == MAP_FAILED) {
+    fprintf(stderr, "mmap error %ld\n", (long)gpio_map);
+    return false;
   }
-}
-} // end anonymous namespace
 
-// Public PinPulser factory
-PinPulser *PinPulser::Create(GPIO *io, uint32_t gpio_mask,
-                             const std::vector<int> &nano_wait_spec) {
-  // The only implementation so far.
-  if (!Timers::Init()) return NULL;
-  return new TimerBasedPinPulser(io, gpio_mask, nano_wait_spec);
-}
+  gpio_port_ = (volatile uint32_t *)gpio_map;
 
-} // namespace rgb_matrix
+  return true;
+}
+}  // namespace rgb_matrix

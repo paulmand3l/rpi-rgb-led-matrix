@@ -19,151 +19,113 @@
 
 #include "framebuffer-internal.h"
 
-#include <stdio.h>
 #include <assert.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <math.h>
 
-#include "gpio.h"
-
 namespace rgb_matrix {
-namespace internal {
 enum {
   kBitPlanes = 11  // maximum usable bitplanes.
 };
 
 static const long kBaseTimeNanos = 200;
 
-// We need one global instance of a timing correct pulser. There are different
-// implementations depending on the context.
-static PinPulser *sOutputEnablePulser = NULL;
+volatile uint32_t *freeRunTimer = NULL; // GPIO may override on startup
 
-// The Adafruit HAT only supports one chain.
-#if defined(ADAFRUIT_RGBMATRIX_HAT) && defined(SUPPORT_MULTI_PARALLEL)
-#  warning "Adafruit HAT doesn't map parallel chains. Disabling parallel chains."
-#  undef SUPPORT_MULTI_PARALLEL
-#endif
+static void sleep_nanos(long nanos) {
+  if (nanos > 28000) {
+    if(freeRunTimer) { // Pi 2?
+      // nanosleep() is ALL MESSED UP on Pi 2.  Instead we'll poll the
+      // free-running timer.  Spinning like this would clobber the single-
+      // core Pi 1 (hence nanosleep below), but seems OK-ish on the Pi 2.
+      // nanosleep() would still be preferred, but we might need to wait
+      // for an OS update with decent timer resolution.
+      uint32_t micros    = nanos / 1000,
+               startTime = *freeRunTimer;
+      while((*freeRunTimer - startTime) < micros);
+    } else {
+      // On Pi 1, nanosleep() is only mildly messed up, with a ~20 usec
+      // offset that must be compensated for.  For very short intervals
+      // (<30 uS, below) an idle counter loop is used instead.
+      struct timespec sleep_time = { 0, nanos - 20000 };
+      nanosleep(&sleep_time, NULL);
+    }
+  } else {
+    // The following loop is determined empirically
+    for(volatile int i = nanos >> 3; i--; );
+  }
+}
 
-// Only if SUPPORT_MULTI_PARALLEL is not defined, we allow classic wiring.
-// Also, the Adafruit HAT does not do classic wiring either.
-#if defined(SUPPORT_MULTI_PARALLEL) || defined(ADAFRUIT_RGBMATRIX_HAT)
-#  undef SUPPORT_CLASSIC_LED_GPIO_WIRING_
-#else
-#  define SUPPORT_CLASSIC_LED_GPIO_WIRING_
-#endif
-
-Framebuffer::Framebuffer(int rows, int columns, int parallel)
-  : rows_(rows),
-#ifdef SUPPORT_MULTI_PARALLEL
-    parallel_(parallel),
-#endif
-    height_(rows * parallel),
-    columns_(columns),
-    pwm_bits_(kBitPlanes), do_luminance_correct_(true), brightness_(100),
+RGBMatrix::Framebuffer::Framebuffer(int rows, int columns)
+  : rows_(rows), columns_(columns),
+    pwm_bits_(kBitPlanes), do_luminance_correct_(true),
     double_rows_(rows / 2), row_mask_(double_rows_ - 1) {
   bitplane_buffer_ = new IoBits [double_rows_ * columns_ * kBitPlanes];
   Clear();
-  assert(rows_ <= 32);
-  assert(parallel >= 1 && parallel <= 3);
-#ifndef SUPPORT_MULTI_PARALLEL
-  if (parallel > 1) {
-    fprintf(stderr, "In order for parallel > 1 to work, you need to "
-            "define SUPPORT_MULTI_PARALLEL in lib/Makefile.\n");
-    assert(parallel == 1);
-  }
-#endif
 }
 
-Framebuffer::~Framebuffer() {
+RGBMatrix::Framebuffer::~Framebuffer() {
   delete [] bitplane_buffer_;
 }
 
-/* static */ void Framebuffer::InitGPIO(GPIO *io, int parallel) {
-  if (sOutputEnablePulser != NULL)
-    return;  // already initialized.
-
+/* statuc */ void RGBMatrix::Framebuffer::InitGPIO(GPIO *io) {
   // Tell GPIO about all bits we intend to use.
   IoBits b;
   b.raw = 0;
-
-#ifdef SUPPORT_CLASSIC_LED_GPIO_WIRING_
+#ifdef ADAFRUIT_RGBMATRIX_HAT
+  b.bits.output_enable = 1;
+  b.bits.clock = 1;
+#else
   b.bits.output_enable_rev1 = b.bits.output_enable_rev2 = 1;
   b.bits.clock_rev1 = b.bits.clock_rev2 = 1;
 #endif
 
-  b.bits.output_enable = 1;
-  b.bits.clock = 1;
   b.bits.strobe = 1;
-
-  b.bits.p0_r1 = b.bits.p0_g1 = b.bits.p0_b1 = 1;
-  b.bits.p0_r2 = b.bits.p0_g2 = b.bits.p0_b2 = 1;
-
-#ifdef SUPPORT_MULTI_PARALLEL
-  if (parallel >= 2) {
-    b.bits.p1_r1 = b.bits.p1_g1 = b.bits.p1_b1 = 1;
-    b.bits.p1_r2 = b.bits.p1_g2 = b.bits.p1_b2 = 1;
-  }
-
-  if (parallel >= 3) {
-    b.bits.p2_r1 = b.bits.p2_g1 = b.bits.p2_b1 = 1;
-    b.bits.p2_r2 = b.bits.p2_g2 = b.bits.p2_b2 = 1;
-  }
-#endif
-
+  b.bits.r1 = b.bits.g1 = b.bits.b1 = 1;
+  b.bits.r2 = b.bits.g2 = b.bits.b2 = 1;
+#ifdef ADAFRUIT_RGBMATRIX_HAT
   b.bits.a = b.bits.b = b.bits.c = b.bits.d = 1;
-
+#else
+  b.bits.row = 0x0f;
+#endif
   // Initialize outputs, make sure that all of these are supported bits.
   const uint32_t result = io->InitOutputs(b.raw);
+  printf("Result: 0x%X v 0x%X\n", result, b.raw);
   assert(result == b.raw);
-
-  // Now, set up the PinPulser for output enable.
-  IoBits output_enable_bits;
-#ifdef SUPPORT_CLASSIC_LED_GPIO_WIRING_
-  output_enable_bits.bits.output_enable_rev1
-    = output_enable_bits.bits.output_enable_rev2 = 1;
-#endif
-  output_enable_bits.bits.output_enable = 1;
-
-  std::vector<int> bitplane_timings;
-  for (int b = 0; b < kBitPlanes; ++b) {
-    bitplane_timings.push_back(kBaseTimeNanos << b);
-  }
-  sOutputEnablePulser = PinPulser::Create(io, output_enable_bits.raw,
-                                          bitplane_timings);
 }
 
-bool Framebuffer::SetPWMBits(uint8_t value) {
+bool RGBMatrix::Framebuffer::SetPWMBits(uint8_t value) {
   if (value < 1 || value > kBitPlanes)
     return false;
   pwm_bits_ = value;
   return true;
 }
 
-inline Framebuffer::IoBits *Framebuffer::ValueAt(int double_row,
-                                                 int column, int bit) {
+inline RGBMatrix::Framebuffer::IoBits *
+RGBMatrix::Framebuffer::ValueAt(int double_row, int column, int bit) {
   return &bitplane_buffer_[ double_row * (columns_ * kBitPlanes)
                             + bit * columns_
                             + column ];
 }
 
 // Do CIE1931 luminance correction and scale to output bitplanes
-static uint16_t luminance_cie1931(uint8_t c, uint8_t brightness) {
+static uint16_t luminance_cie1931(uint8_t c) {
   float out_factor = ((1 << kBitPlanes) - 1);
-  float v = (float) c * brightness / 255.0;
+  float v = c * 100.0 / 255.0;
   return out_factor * ((v <= 8) ? v / 902.3 : pow((v + 16) / 116.0, 3));
 }
 
 static uint16_t *CreateLuminanceCIE1931LookupTable() {
-  uint16_t *result = new uint16_t[256 * 100];
+  uint16_t *result = new uint16_t [ 256 ];
   for (int i = 0; i < 256; ++i)
-    for (int j = 0; j < 100; ++j)
-      result[i * 100 + j] = luminance_cie1931(i, j + 1);
-
+    result[i] = luminance_cie1931(i);
   return result;
 }
 
-inline uint16_t Framebuffer::MapColor(uint8_t c) {
+inline uint16_t RGBMatrix::Framebuffer::MapColor(uint8_t c) {
 #ifdef INVERSE_RGB_DISPLAY_COLORS
 #  define COLOR_OUT_BITS(x) (x) ^ 0xffff
 #else
@@ -171,12 +133,10 @@ inline uint16_t Framebuffer::MapColor(uint8_t c) {
 #endif
 
   if (do_luminance_correct_) {
+    // We're leaking this table. So be it :)
     static uint16_t *luminance_lookup = CreateLuminanceCIE1931LookupTable();
-    return COLOR_OUT_BITS(luminance_lookup[c * 100 + brightness_ - 1]);
+    return COLOR_OUT_BITS(luminance_lookup[c]);
   } else {
-    // simple scale down the color value
-    c = c * brightness_ / 100;
-
     enum {shift = kBitPlanes - 8};  //constexpr; shift to be left aligned.
     return COLOR_OUT_BITS((shift > 0) ? (c << shift) : (c >> -shift));
   }
@@ -184,7 +144,7 @@ inline uint16_t Framebuffer::MapColor(uint8_t c) {
 #undef COLOR_OUT_BITS
 }
 
-void Framebuffer::Clear() {
+void RGBMatrix::Framebuffer::Clear() {
 #ifdef INVERSE_RGB_DISPLAY_COLORS
   Fill(0, 0, 0);
 #else
@@ -193,7 +153,7 @@ void Framebuffer::Clear() {
 #endif
 }
 
-void Framebuffer::Fill(uint8_t r, uint8_t g, uint8_t b) {
+void RGBMatrix::Framebuffer::Fill(uint8_t r, uint8_t g, uint8_t b) {
   const uint16_t red   = MapColor(r);
   const uint16_t green = MapColor(g);
   const uint16_t blue  = MapColor(b);
@@ -202,18 +162,9 @@ void Framebuffer::Fill(uint8_t r, uint8_t g, uint8_t b) {
     uint16_t mask = 1 << b;
     IoBits plane_bits;
     plane_bits.raw = 0;
-    plane_bits.bits.p0_r1 = plane_bits.bits.p0_r2 = (red & mask) == mask;
-    plane_bits.bits.p0_g1 = plane_bits.bits.p0_g2 = (green & mask) == mask;
-    plane_bits.bits.p0_b1 = plane_bits.bits.p0_b2 = (blue & mask) == mask;
-
-#ifdef SUPPORT_MULTI_PARALLEL
-    plane_bits.bits.p1_r1 = plane_bits.bits.p1_r2 =
-      plane_bits.bits.p2_r1 = plane_bits.bits.p2_r2 = (red & mask) == mask;
-    plane_bits.bits.p1_g1 = plane_bits.bits.p1_g2 =
-      plane_bits.bits.p2_g1 = plane_bits.bits.p2_g2 = (green & mask) == mask;
-    plane_bits.bits.p1_b1 = plane_bits.bits.p1_b2 =
-      plane_bits.bits.p2_b1 = plane_bits.bits.p2_b2 = (blue & mask) == mask;
-#endif
+    plane_bits.bits.r1 = plane_bits.bits.r2 = (red & mask) == mask;
+    plane_bits.bits.g1 = plane_bits.bits.g2 = (green & mask) == mask;
+    plane_bits.bits.b1 = plane_bits.bits.b2 = (blue & mask) == mask;
     for (int row = 0; row < double_rows_; ++row) {
       IoBits *row_data = ValueAt(row, 0, b);
       for (int col = 0; col < columns_; ++col) {
@@ -223,9 +174,9 @@ void Framebuffer::Fill(uint8_t r, uint8_t g, uint8_t b) {
   }
 }
 
-void Framebuffer::SetPixel(int x, int y,
+void RGBMatrix::Framebuffer::SetPixel(int x, int y,
                                       uint8_t r, uint8_t g, uint8_t b) {
-  if (x < 0 || x >= columns_ || y < 0 || y >= height_) return;
+  if (x < 0 || x >= columns_ || y < 0 || y >= rows_) return;
 
   const uint16_t red   = MapColor(r);
   const uint16_t green = MapColor(g);
@@ -233,123 +184,63 @@ void Framebuffer::SetPixel(int x, int y,
 
   const int min_bit_plane = kBitPlanes - pwm_bits_;
   IoBits *bits = ValueAt(y & row_mask_, x, min_bit_plane);
-
-  // Manually expand the three cases for better performance.
-  // TODO(hzeller): This is a bit repetetive. Test if it pays off to just
-  // pre-calc rgb mask and apply.
-  if (y < rows_) {
-    // Parallel chain #1
-    if (y < double_rows_) {   // Upper sub-panel.
-      for (int b = min_bit_plane; b < kBitPlanes; ++b) {
-        const uint16_t mask = 1 << b;
-        bits->bits.p0_r1 = (red & mask) == mask;
-        bits->bits.p0_g1 = (green & mask) == mask;
-        bits->bits.p0_b1 = (blue & mask) == mask;
-        bits += columns_;
-      }
-    } else {
-      for (int b = min_bit_plane; b < kBitPlanes; ++b) {
-        const uint16_t mask = 1 << b;
-        bits->bits.p0_r2 = (red & mask) == mask;
-        bits->bits.p0_g2 = (green & mask) == mask;
-        bits->bits.p0_b2 = (blue & mask) == mask;
-        bits += columns_;
-      }
-    }
-#ifdef SUPPORT_MULTI_PARALLEL
-  } else if (y >= rows_ && y < 2 * rows_) {
-    // Parallel chain #2
-    if (y - rows_ < double_rows_) {   // Upper sub-panel.
-      for (int b = min_bit_plane; b < kBitPlanes; ++b) {
-        const uint16_t mask = 1 << b;
-        bits->bits.p1_r1 = (red & mask) == mask;
-        bits->bits.p1_g1 = (green & mask) == mask;
-        bits->bits.p1_b1 = (blue & mask) == mask;
-        bits += columns_;
-      }
-    } else {
-      for (int b = min_bit_plane; b < kBitPlanes; ++b) {
-        const uint16_t mask = 1 << b;
-        bits->bits.p1_r2 = (red & mask) == mask;
-        bits->bits.p1_g2 = (green & mask) == mask;
-        bits->bits.p1_b2 = (blue & mask) == mask;
-        bits += columns_;
-      }
+  if (y < double_rows_) {   // Upper sub-panel.
+    for (int b = min_bit_plane; b < kBitPlanes; ++b) {
+      const uint16_t mask = 1 << b;
+      bits->bits.r1 = (red & mask) == mask;
+      bits->bits.g1 = (green & mask) == mask;
+      bits->bits.b1 = (blue & mask) == mask;
+      bits += columns_;
     }
   } else {
-    // Parallel chain #3
-    if (y - 2*rows_ < double_rows_) {   // Upper sub-panel.
-      for (int b = min_bit_plane; b < kBitPlanes; ++b) {
-        const uint16_t mask = 1 << b;
-        bits->bits.p2_r1 = (red & mask) == mask;
-        bits->bits.p2_g1 = (green & mask) == mask;
-        bits->bits.p2_b1 = (blue & mask) == mask;
-        bits += columns_;
-      }
-    } else {
-      for (int b = min_bit_plane; b < kBitPlanes; ++b) {
-        const uint16_t mask = 1 << b;
-        bits->bits.p2_r2 = (red & mask) == mask;
-        bits->bits.p2_g2 = (green & mask) == mask;
-        bits->bits.p2_b2 = (blue & mask) == mask;
-        bits += columns_;
-      }
+    for (int b = min_bit_plane; b < kBitPlanes; ++b) {
+      const uint16_t mask = 1 << b;
+      bits->bits.r2 = (red & mask) == mask;
+      bits->bits.g2 = (green & mask) == mask;
+      bits->bits.b2 = (blue & mask) == mask;
+      bits += columns_;
     }
-#endif
   }
 }
 
-void Framebuffer::DumpToMatrix(GPIO *io) {
+void RGBMatrix::Framebuffer::DumpToMatrix(GPIO *io) {
   IoBits color_clk_mask;   // Mask of bits we need to set while clocking in.
-  color_clk_mask.bits.p0_r1
-    = color_clk_mask.bits.p0_g1
-    = color_clk_mask.bits.p0_b1
-    = color_clk_mask.bits.p0_r2
-    = color_clk_mask.bits.p0_g2
-    = color_clk_mask.bits.p0_b2 = 1;
-
-#ifdef SUPPORT_MULTI_PARALLEL
-  if (parallel_ >= 2) {
-    color_clk_mask.bits.p1_r1
-      = color_clk_mask.bits.p1_g1
-      = color_clk_mask.bits.p1_b1
-      = color_clk_mask.bits.p1_r2
-      = color_clk_mask.bits.p1_g2
-      = color_clk_mask.bits.p1_b2 = 1;
-  }
-
-  if (parallel_ >= 3) {
-    color_clk_mask.bits.p2_r1
-      = color_clk_mask.bits.p2_g1
-      = color_clk_mask.bits.p2_b1
-      = color_clk_mask.bits.p2_r2
-      = color_clk_mask.bits.p2_g2
-      = color_clk_mask.bits.p2_b2 = 1;
-  }
-#endif
-
-#ifdef SUPPORT_CLASSIC_LED_GPIO_WIRING_
+  color_clk_mask.bits.r1 = color_clk_mask.bits.g1 = color_clk_mask.bits.b1 = 1;
+  color_clk_mask.bits.r2 = color_clk_mask.bits.g2 = color_clk_mask.bits.b2 = 1;
+#ifdef ADAFRUIT_RGBMATRIX_HAT
+  color_clk_mask.bits.clock = 1;
+#else
   color_clk_mask.bits.clock_rev1 = color_clk_mask.bits.clock_rev2 = 1;
 #endif
-  color_clk_mask.bits.clock = 1;
 
   IoBits row_mask;
+#ifdef ADAFRUIT_RGBMATRIX_HAT
   row_mask.bits.a = row_mask.bits.b = row_mask.bits.c = row_mask.bits.d = 1;
-
-  IoBits clock, strobe, row_address;
-#ifdef SUPPORT_CLASSIC_LED_GPIO_WIRING_
-  clock.bits.clock_rev1 = clock.bits.clock_rev2 = 1;
+#else
+  row_mask.bits.row = 0x0f;
 #endif
+
+  IoBits clock, output_enable, strobe, row_address;
+#ifdef ADAFRUIT_RGBMATRIX_HAT
   clock.bits.clock = 1;
+  output_enable.bits.output_enable = 1;
+#else
+  clock.bits.clock_rev1 = clock.bits.clock_rev2 = 1;
+  output_enable.bits.output_enable_rev1 = 1;
+  output_enable.bits.output_enable_rev2 = 1;
+#endif
   strobe.bits.strobe = 1;
 
   const int pwm_to_show = pwm_bits_;  // Local copy, might change in process.
   for (uint8_t d_row = 0; d_row < double_rows_; ++d_row) {
+#ifdef ADAFRUIT_RGBMATRIX_HAT
     row_address.bits.a = d_row;
     row_address.bits.b = d_row >> 1;
     row_address.bits.c = d_row >> 2;
     row_address.bits.d = d_row >> 3;
-
+#else
+    row_address.bits.row = d_row;
+#endif
     io->WriteMaskedBits(row_address.raw, row_mask.raw);  // Set row address
 
     // Rows can't be switched very quickly without ghosting, so we do the
@@ -363,15 +254,17 @@ void Framebuffer::DumpToMatrix(GPIO *io) {
         io->WriteMaskedBits(out.raw, color_clk_mask.raw);  // col + reset clock
         io->SetBits(clock.raw);               // Rising edge: clock color in.
       }
+
       io->ClearBits(color_clk_mask.raw);    // clock back to normal.
 
       io->SetBits(strobe.raw);   // Strobe in the previously clocked in row.
       io->ClearBits(strobe.raw);
 
       // Now switch on for the sleep time necessary for that bit-plane.
-      sOutputEnablePulser->SendPulse(b);
+      io->ClearBits(output_enable.raw);
+      sleep_nanos(kBaseTimeNanos << b);
+      io->SetBits(output_enable.raw);
     }
   }
 }
-}  // namespace internal
 }  // namespace rgb_matrix
